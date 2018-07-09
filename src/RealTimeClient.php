@@ -5,6 +5,8 @@ use Devristo\Phpws\Client\WebSocket;
 use Devristo\Phpws\Messaging\WebSocketMessageInterface;
 use Evenement\EventEmitterTrait;
 use React\Promise;
+use React\Promise\Timer;
+use React\EventLoop\LoopInterface;
 use Slack\Message\Message;
 
 /**
@@ -66,6 +68,22 @@ class RealTimeClient extends ApiClient
     protected $bots = [];
 
     /**
+     * @var \Zend\Log\Logger Logger for this client
+     */
+    protected $logger = null;
+
+    /**
+     * {@inheritDoc}
+     */
+    public function __construct(LoopInterface $loop, GuzzleHttp\ClientInterface $httpClient = null)
+    {
+        parent::__construct($loop, $httpClient);
+
+        $this->logger = new \Zend\Log\Logger();
+        $this->logger->addWriter(new \Zend\Log\Writer\Stream('php://stderr'));
+    }
+
+    /**
      * Connects to the real-time messaging server.
      *
      * @return \React\Promise\PromiseInterface
@@ -77,71 +95,68 @@ class RealTimeClient extends ApiClient
         // Request a real-time connection...
         $this->apiCall('rtm.start')
 
-        // then connect to the socket...
-        ->then(function (Payload $response) {
-            $responseData = $response->getData();
-            // get the team info
-            $this->team = new Team($this, $responseData['team']);
+            // then connect to the socket...
+            ->then(function (Payload $response) {
+                $responseData = $response->getData();
+                // get the team info
+                $this->team = new Team($this, $responseData['team']);
 
-            // Populate self user.
-            $this->users[$responseData['self']['id']] = new User($this, $responseData['self']);
+                // Populate self user.
+                $this->users[$responseData['self']['id']] = new User($this, $responseData['self']);
 
-            // populate list of users
-            foreach ($responseData['users'] as $data) {
-                $this->users[$data['id']] = new User($this, $data);
-            }
+                // populate list of users
+                foreach ($responseData['users'] as $data) {
+                    $this->users[$data['id']] = new User($this, $data);
+                }
 
-            // populate list of channels
-            foreach ($responseData['channels'] as $data) {
-                $this->channels[$data['id']] = new Channel($this, $data);
-            }
+                // populate list of channels
+                foreach ($responseData['channels'] as $data) {
+                    $this->channels[$data['id']] = new Channel($this, $data);
+                }
 
-            // populate list of groups
-            foreach ($responseData['groups'] as $data) {
-                $this->groups[$data['id']] = new Group($this, $data);
-            }
+                // populate list of groups
+                foreach ($responseData['groups'] as $data) {
+                    $this->groups[$data['id']] = new Group($this, $data);
+                }
 
-            // populate list of dms
-            foreach ($responseData['ims'] as $data) {
-                $this->dms[$data['id']] = new DirectMessageChannel($this, $data);
-            }
+                // populate list of dms
+                foreach ($responseData['ims'] as $data) {
+                    $this->dms[$data['id']] = new DirectMessageChannel($this, $data);
+                }
 
-            // populate list of bots
-            foreach ($responseData['bots'] as $data) {
-                $this->bots[$data['id']] = new Bot($this, $data);
-            }
+                // populate list of bots
+                foreach ($responseData['bots'] as $data) {
+                    $this->bots[$data['id']] = new Bot($this, $data);
+                }
 
-            // Log PHPWS things to stderr
-            $logger = new \Zend\Log\Logger();
-            $logger->addWriter(new \Zend\Log\Writer\Stream('php://stderr'));
+                // initiate the websocket connection
+                // write PHPWS things to the existing logger
+                $this->websocket = new WebSocket($responseData['url'], $this->loop, $this->logger);
+                $this->websocket->on('message', function ($message) {
+                    $this->onMessage($message);
+                });
 
-            // initiate the websocket connection
-            $this->websocket = new WebSocket($responseData['url'], $this->loop, $logger);
-            $this->websocket->on('message', function ($message) {
-                $this->onMessage($message);
-            });
-
-            return $this->websocket->open();
-        }, function($exception) use ($deferred) {
-            // if connection was not succesfull
-            $deferred->reject(new ConnectionException(
-                'Could not connect to Slack API: '. $exception->getMessage(),
-                $exception->getCode()
-            ));
-        })
-
-        // then wait for the connection to be ready.
-        ->then(function () use ($deferred) {
-            $this->once('hello', function () use ($deferred) {
-                $deferred->resolve();
-            });
-
-            $this->once('error', function ($data) use ($deferred) {
+                return $this->websocket->open();
+            }, function($exception) use ($deferred) {
+                // if connection was not succesfull
                 $deferred->reject(new ConnectionException(
-                    'Could not connect to WebSocket: '.$data['error']['msg'],
-                    $data['error']['code']));
+                    'Could not connect to Slack API: '. $exception->getMessage(),
+                    $exception->getCode()
+                ));
+            })
+
+            // then wait for the connection to be ready.
+            ->then(function () use ($deferred) {
+                $this->once('hello', function () use ($deferred) {
+                    $deferred->resolve();
+                });
+
+                $this->once('error', function ($data) use ($deferred) {
+                    $deferred->reject(new ConnectionException(
+                        'Could not connect to WebSocket: '.$data['error']['msg'],
+                        $data['error']['code']));
+                });
             });
-        });
 
         return $deferred->promise();
     }
@@ -349,13 +364,47 @@ class RealTimeClient extends ApiClient
     }
 
     /**
-     * Set as typing
+     * Check the websocket connection by sending a ping
      *
-     * @param \Slack\ChannelInterface $channel The channel to set typing indicator in.
+     * @param float $timeout The maximum wait time for receiving the pong
+     * @param array $payload Additional payload items
      *
      * @return \React\Promise\PromiseInterface
      */
-    public function setAsTyping(ChannelInterface $channel)
+    public function checkConnection($timeout = 5.0, $payload = [])
+    {
+        $data = array_merge($payload, [
+            'id' => ++$this->lastMessageId,
+            'type' => 'ping'
+        ]);
+        $this->websocket->send(json_encode($data));
+
+        $deferred = new Promise\Deferred();
+        $this->pendingMessages[$this->lastMessageId] = $deferred;
+
+        $promise = $deferred->promise();
+        return Timer\timeout($promise, $timeout, $this->loop)
+            ->then(function ($value) {
+                $this->logger->info('Received pong');
+                // pong received within timeout
+            })
+            ->otherwise(function (Timer\TimeoutException $error) {
+                $this->logger->notice('Lost websocket connection, re-connecting..');
+                $this->disconnect();
+                $this->connect();
+                $this->logger->notice('reconnected');
+            });
+    }
+
+    /**
+     * Set as typing
+     *
+     * @param \Slack\ChannelInterface $channel The channel to set typing indicator in.
+     * @param bool $callDeferred Whether to call the API asynchronous or not.
+     *
+     * @return \React\Promise\PromiseInterface
+     */
+    public function setAsTyping(ChannelInterface $channel, $callDeferred = true)
     {
         if (!$this->connected) {
             return Promise\reject(new ConnectionException('Client not connected. Did you forget to call `connect()`?'));
@@ -367,6 +416,12 @@ class RealTimeClient extends ApiClient
             'channel' => $channel->data['id'],
         ];
         $this->websocket->send(json_encode($data));
+
+        // Perform an iteration of the event loop in order to send the
+        // web socket message synchronously
+        if (!$callDeferred) {
+            $this->loop->tick();
+        }
 
         return Promise\resolve();
     }
@@ -480,7 +535,9 @@ class RealTimeClient extends ApiClient
 
             // emit an event with the attached json
             $this->emit($payload['type'], [$payload]);
-        } else {
+        }
+
+        if (!isset($payload['type']) || $payload['type'] == 'pong') {
             // If reply_to is set, then it is a server confirmation for a previously
             // sent message
             if (isset($payload['reply_to'])) {
@@ -488,7 +545,7 @@ class RealTimeClient extends ApiClient
                     $deferred = $this->pendingMessages[$payload['reply_to']];
 
                     // Resolve or reject the promise that was waiting for the reply.
-                    if (isset($payload['ok']) && $payload['ok'] === true) {
+                    if (isset($payload['ok']) && $payload['ok'] === true || $payload['type'] == 'pong') {
                         $deferred->resolve();
                     } else {
                         $deferred->reject($payload['error']);
