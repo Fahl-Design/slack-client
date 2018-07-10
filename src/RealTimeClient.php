@@ -84,6 +84,14 @@ class RealTimeClient extends ApiClient
     }
 
     /**
+     * @return \Zend\Log\Logger
+     */
+    public function getLogger()
+    {
+        return $this->logger;
+    }
+
+    /**
      * Connects to the real-time messaging server.
      *
      * @return \React\Promise\PromiseInterface
@@ -385,7 +393,7 @@ class RealTimeClient extends ApiClient
         $promise = $deferred->promise();
         return Timer\timeout($promise, $timeout, $this->loop)
             ->then(function ($value) {
-                $this->logger->info('Received pong');
+                // $this->logger->info('Received pong');
                 // pong received within timeout
             })
             ->otherwise(function (Timer\TimeoutException $error) {
